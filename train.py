@@ -23,9 +23,9 @@ def str2bool(v):
 parser = argparse.ArgumentParser(
     description='Single Shot MultiBox Detector Training With Pytorch')
 train_set = parser.add_mutually_exclusive_group()
-parser.add_argument('--dataset', default='VOC', choices=['VOC', 'COCO'],
+parser.add_argument('--dataset', default='COCO', choices=['VOC', 'COCO'],
                     type=str, help='VOC or COCO')
-parser.add_argument('--dataset_root', default=VOC_ROOT,
+parser.add_argument('--dataset_root', default=COCO_ROOT,
                     help='Dataset root directory path')
 parser.add_argument('--basenet', default='vgg16_reducedfc.pth',
                     help='Pretrained base model')
@@ -51,6 +51,14 @@ parser.add_argument('--visdom', default=False, type=str2bool,
                     help='Use visdom for loss visualization')
 parser.add_argument('--save_folder', default='weights/',
                     help='Directory for saving checkpoint models')
+
+parser.add_argument('--train_val', default=False, type=str2bool,
+                    help='Whether to split train into train&val')
+parser.add_argument('--tb', default=False, type=str2bool, 
+                    help='Set it to True to use tensorboard')
+parser.add_argument('--tb_prd', default=.25, type=float, 
+                    help='Set tensorboard update period (* epoch_size)')
+
 args = parser.parse_args()
 
 
@@ -101,21 +109,26 @@ def train():
 
     if args.resume:
         print('Resuming training, loading {}...'.format(args.resume))
-        ssd_net.load_weights(args.resume)
+        model_checkpoint = torch.load(args.resume)
+        ssd_net.load_state_dict(model_checkpoint['ssd_state_dict'])
+        start_iter = model_checkpoint['iter']
     else:
         vgg_weights = torch.load(args.save_folder + args.basenet)
         print('Loading base network...')
         ssd_net.vgg.load_state_dict(vgg_weights)
+        start_iter = 1
 
-    if args.cuda:
-        net = net.cuda()
-
-    if not args.resume:
         print('Initializing weights...')
         # initialize newly added layers' weights with xavier method
         ssd_net.extras.apply(weights_init)
         ssd_net.loc.apply(weights_init)
         ssd_net.conf.apply(weights_init)
+
+    if args.start_iter != 0:
+        start_iter = args.start_iter
+
+    if args.cuda:
+        net = net.cuda()
 
     optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=args.momentum,
                           weight_decay=args.weight_decay)
@@ -149,12 +162,8 @@ def train():
     # create batch iterator
     batch_iterator = iter(data_loader)
     for iteration in range(args.start_iter, cfg['max_iter']):
-        if args.visdom and iteration != 0 and (iteration % epoch_size == 0):
-            update_vis_plot(epoch, loc_loss, conf_loss, epoch_plot, None,
-                            'append', epoch_size)
-            # reset epoch loss counters
-            loc_loss = 0
-            conf_loss = 0
+        if (iteration % epoch_size == 0):
+            batch_iterator = iter(data_loader)
             epoch += 1
 
         if iteration in cfg['lr_steps']:
@@ -191,10 +200,21 @@ def train():
             update_vis_plot(iteration, loss_l.data[0], loss_c.data[0],
                             iter_plot, epoch_plot, 'append')
 
+        if args.tb and iteration % (epoch_size * args.tb_prd) == 0:
+            info = {
+                'loc loss': loc_loss / (epoch_size * args.tb_prd),
+                'conf loss': conf_loss / (epoch_size * args.tb_prd)
+            }
+            loc_loss = 0
+            conf_loss = 0
+            for tag, value in info.items():
+                logger.scalar_summary(tag, value, iteration)
+
         if iteration != 0 and iteration % 5000 == 0:
             print('Saving state, iter:', iteration)
-            torch.save(ssd_net.state_dict(), 'weights/ssd300_COCO_' +
-                       repr(iteration) + '.pth')
+            torch.save({'iter':iteration,
+                        'ssd_state_dict': ssd_net.state_dict()},
+                        '{}/ssd{}_{}_{}.tar'.format(weight_save_dir, cfg['min_dim'], args.dataset, iteration))
     torch.save(ssd_net.state_dict(),
                args.save_folder + '' + args.dataset + '.pth')
 
