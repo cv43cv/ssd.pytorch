@@ -1,7 +1,7 @@
 from data import *
 from utils.augmentations import SSDAugmentation
 from layers.modules import MultiBoxLoss
-from ssd import build_ssd
+from ipssd import build_ipssd
 import os
 import sys
 import time
@@ -14,11 +14,11 @@ import torch.nn.init as init
 import torch.utils.data as data
 import numpy as np
 import argparse
+from logger import Logger 
 
 
 def str2bool(v):
     return v.lower() in ("yes", "true", "t", "1")
-
 
 parser = argparse.ArgumentParser(
     description='Single Shot MultiBox Detector Training With Pytorch')
@@ -27,14 +27,12 @@ parser.add_argument('--dataset', default='COCO', choices=['VOC', 'COCO'],
                     type=str, help='VOC or COCO')
 parser.add_argument('--dataset_root', default=COCO_ROOT,
                     help='Dataset root directory path')
-parser.add_argument('--basenet', default='vgg16_reducedfc.pth',
-                    help='Pretrained base model')
 parser.add_argument('--batch_size', default=32, type=int,
                     help='Batch size for training')
 parser.add_argument('--resume', default=None, type=str,
                     help='Checkpoint state_dict file to resume training from')
 parser.add_argument('--start_iter', default=0, type=int,
-                    help='Resume training at this iter')
+                    help='Resume training at this iter. If 0 use default value')
 parser.add_argument('--num_workers', default=4, type=int,
                     help='Number of workers used in dataloading')
 parser.add_argument('--cuda', default=True, type=str2bool,
@@ -43,23 +41,36 @@ parser.add_argument('--lr', '--learning-rate', default=1e-3, type=float,
                     help='initial learning rate')
 parser.add_argument('--momentum', default=0.9, type=float,
                     help='Momentum value for optim')
-parser.add_argument('--weight_decay', default=5e-4, type=float,
+parser.add_argument('--weight_decay', default=1e-3, type=float,
                     help='Weight decay for SGD')
 parser.add_argument('--gamma', default=0.1, type=float,
                     help='Gamma update for SGD')
-parser.add_argument('--visdom', default=False, type=str2bool,
-                    help='Use visdom for loss visualization')
 parser.add_argument('--save_folder', default='weights/',
                     help='Directory for saving checkpoint models')
 
 parser.add_argument('--train_val', default=False, type=str2bool,
                     help='Whether to split train into train&val')
+parser.add_argument('--log_dir', default='./logs', 
+                    help='Directory for tensorboard logs')
 parser.add_argument('--tb', default=False, type=str2bool, 
                     help='Set it to True to use tensorboard')
 parser.add_argument('--tb_prd', default=.25, type=float, 
                     help='Set tensorboard update period (* epoch_size)')
+parser.add_argument('--exp_name', default='original', 
+                    help='Experimental Name - prefix of the model checkpoint file')
 
 args = parser.parse_args()
+
+weight_save_dir = os.path.join(args.save_folder , args.exp_name)
+
+if not os.path.exists(weight_save_dir):
+    os.mkdir(weight_save_dir)
+
+if args.tb:
+    full_log_dir = os.path.join(args.log_dir, args.exp_name)
+    if not os.path.exists(full_log_dir):
+        os.mkdir(full_log_dir)
+    logger = Logger(full_log_dir)
 
 
 if torch.cuda.is_available():
@@ -86,43 +97,34 @@ def train():
             args.dataset_root = COCO_ROOT
         cfg = coco
         dataset = COCODetection(root=args.dataset_root,
-                                transform=SSDAugmentation(cfg['min_dim'],
-                                                          MEANS))
+                                transform=SSDAugmentation())
     elif args.dataset == 'VOC':
         if args.dataset_root == COCO_ROOT:
             parser.error('Must specify dataset if specifying dataset_root')
         cfg = voc
         dataset = VOCDetection(root=args.dataset_root,
-                               transform=SSDAugmentation(cfg['min_dim'],
-                                                         MEANS))
+                               transform=SSDAugmentation())
 
-    if args.visdom:
-        import visdom
-        viz = visdom.Visdom()
-
-    ssd_net = build_ssd('train', cfg['min_dim'], cfg['num_classes'])
-    net = ssd_net
+    ipssd_net = build_ipssd('train', cfg['min_dim'], cfg['num_classes'])
+    net = ipssd_net
 
     if args.cuda:
-        net = torch.nn.DataParallel(ssd_net)
+        net = torch.nn.DataParallel(ipssd_net)
         cudnn.benchmark = True
 
     if args.resume:
         print('Resuming training, loading {}...'.format(args.resume))
         model_checkpoint = torch.load(args.resume)
-        ssd_net.load_state_dict(model_checkpoint['ssd_state_dict'])
+        ipssd_net.load_state_dict(model_checkpoint['ssd_state_dict'])
         start_iter = model_checkpoint['iter']
     else:
-        vgg_weights = torch.load(args.save_folder + args.basenet)
-        print('Loading base network...')
-        ssd_net.vgg.load_state_dict(vgg_weights)
         start_iter = 1
 
         print('Initializing weights...')
         # initialize newly added layers' weights with xavier method
-        ssd_net.extras.apply(weights_init)
-        ssd_net.loc.apply(weights_init)
-        ssd_net.conf.apply(weights_init)
+        ipssd_net.extras.apply(weights_init)
+        ipssd_net.loc.apply(weights_init)
+        ipssd_net.conf.apply(weights_init)
 
     if args.start_iter != 0:
         start_iter = args.start_iter
@@ -149,19 +151,13 @@ def train():
 
     step_index = 0
 
-    if args.visdom:
-        vis_title = 'SSD.PyTorch on ' + dataset.name
-        vis_legend = ['Loc Loss', 'Conf Loss', 'Total Loss']
-        iter_plot = create_vis_plot('Iteration', 'Loss', vis_title, vis_legend)
-        epoch_plot = create_vis_plot('Epoch', 'Loss', vis_title, vis_legend)
-
     data_loader = data.DataLoader(dataset, args.batch_size,
                                   num_workers=args.num_workers,
                                   shuffle=True, collate_fn=detection_collate,
                                   pin_memory=True)
     # create batch iterator
     batch_iterator = iter(data_loader)
-    for iteration in range(args.start_iter, cfg['max_iter']):
+    for iteration in range(start_iter, cfg['max_iter']):
         if (iteration % epoch_size == 0):
             batch_iterator = iter(data_loader)
             epoch += 1
@@ -189,16 +185,16 @@ def train():
         loss.backward()
         optimizer.step()
         t1 = time.time()
-        loc_loss += loss_l.data[0]
         conf_loss += loss_c.data[0]
+        if loss_l.data[0] < 1000000:
+            loc_loss += loss_l.data[0]
+
+        print('☆★☆★', end = '', flush=True)
 
         if iteration % 10 == 0:
-            print('timer: %.4f sec.' % (t1 - t0))
+            print('', end='\r')
             print('iter ' + repr(iteration) + ' || Loss: %.4f ||' % (loss.data[0]), end=' ')
-
-        if args.visdom:
-            update_vis_plot(iteration, loss_l.data[0], loss_c.data[0],
-                            iter_plot, epoch_plot, 'append')
+            print('timer: %.4f sec.' % (t1 - t0))
 
         if args.tb and iteration % (epoch_size * args.tb_prd) == 0:
             info = {
@@ -210,12 +206,12 @@ def train():
             for tag, value in info.items():
                 logger.scalar_summary(tag, value, iteration)
 
-        if iteration != 0 and iteration % 5000 == 0:
+        if iteration % 10000 == 0:
             print('Saving state, iter:', iteration)
             torch.save({'iter':iteration,
-                        'ssd_state_dict': ssd_net.state_dict()},
-                        '{}/ssd{}_{}_{}.tar'.format(weight_save_dir, cfg['min_dim'], args.dataset, iteration))
-    torch.save(ssd_net.state_dict(),
+                        'ssd_state_dict': ipssd_net.state_dict()},
+                        '{}/{}_{}.tar'.format(weight_save_dir, args.exp_name, iteration))
+    torch.save(ipssd_net.state_dict(),
                args.save_folder + '' + args.dataset + '.pth')
 
 
